@@ -1,0 +1,581 @@
+// src/services/tesistaTramitesServices/ServiceObservaciones.ts
+import { supabase } from '@/lib/supabase'
+import { uploadArchivoWithRename } from '@/services/TramiteService'
+
+// ================================
+// INTERFACES PARA ETAPAS 2-4
+// ================================
+
+export interface ObservacionData {
+    id: number
+    id_tramite: number
+    id_etapa: number
+    id_usuario: number
+    id_rol: number
+    visto_bueno: number
+    observacion: string | null
+    fecha: string
+    usuario: {
+        id: number
+        nombres: string | null
+        apellidos: string | null
+    }
+    rol_servicio: {
+        id: number
+        servicio: {
+            id: number
+            nombre: string
+            descripcion: string | null
+        }
+    }
+}
+
+export interface CorreccionFormData {
+    metadatos: { titulo: string; abstract: string; keywords: string; presupuesto: number; conclusiones?: string }
+    archivos: { file: File; tipoId: number }[]
+}
+
+export interface EstadoObservaciones {
+    tieneCorrecciones: boolean
+    numeroCorrecciones: number
+    yaEnvioCorrección: boolean
+    observaciones: ObservacionData[]
+}
+
+export interface TipoArchivo {
+    id: number
+    nombre: string
+    descripcion: string | null
+    obligatorio: boolean
+    max_size: number
+}
+
+// ================================
+// FUNCIONES DE OBSERVACIONES ETAPAS 2-4
+// ================================
+
+/**
+ * Obtiene el estado de observaciones para etapas 2, 3, 4, 11, 16 - LÓGICA CORREGIDA
+ */
+export async function getEstadoObservaciones(tramiteId: number, etapa: number): Promise<EstadoObservaciones> {
+    // Validar que sea etapa 2, 3, 4, 11, o 16
+    if (![2, 3, 4, 11, 16].includes(etapa)) {
+        throw new Error(`Etapa ${etapa} no soportada en ServiceObservaciones`)
+    }
+
+    try {
+        console.log(`🔍 Verificando observaciones para trámite ${tramiteId} en etapa ${etapa}`)
+
+        // 1. Obtener todas las observaciones de la etapa
+        const { data: observaciones, error } = await supabase
+            .from('tbl_observaciones')
+            .select(`
+                id,
+                id_tramite,
+                id_etapa,
+                id_usuario,
+                id_rol,
+                visto_bueno,
+                observacion,
+                fecha,
+                usuario:id_usuario(
+                    id,
+                    nombres,
+                    apellidos
+                ),
+                rol_servicio:id_rol(
+                    id,
+                    servicio:id_servicio(
+                        id,
+                        nombre,
+                        descripcion
+                    )
+                )
+            `)
+            .eq('id_tramite', tramiteId)
+            .eq('id_etapa', etapa)
+            .order('fecha', { ascending: false })
+
+        if (error) {
+            console.error('Error obteniendo observaciones:', error)
+            throw new Error('Error al obtener las observaciones')
+        }
+
+        // 2. Contar observaciones pendientes (visto_bueno = 0)
+        const observacionesPendientes = observaciones?.filter(obs => obs.visto_bueno === 0) || []
+        const numeroObservaciones = observacionesPendientes.length
+
+        console.log(`📋 Observaciones pendientes encontradas: ${numeroObservaciones}`)
+
+        // 3. Contar correcciones enviadas (logs con id_accion dinámico según etapa)
+        const idAccion = getIdAccionCorrecion(etapa)
+        const { data: logCorrecciones, error: logError } = await supabase
+            .from('log_acciones')
+            .select('id, fecha, mensaje')
+            .eq('id_tramite', tramiteId)
+            .eq('id_etapa', etapa)
+            .eq('id_accion', idAccion) // Dinámico según etapa
+            .order('fecha', { ascending: false })
+
+        if (logError) {
+            console.error('Error obteniendo logs de correcciones:', logError)
+            throw new Error('Error al verificar el historial de correcciones')
+        }
+
+        const numeroCorrecciones = logCorrecciones?.length || 0
+        console.log(`📝 Correcciones enviadas encontradas: ${numeroCorrecciones}`)
+
+        // 4. LÓGICA ESPECIAL PARA ETAPA 16
+        let tieneCorrecciones: boolean
+        let yaEnvioCorrección: boolean
+
+        if (etapa === 16) {
+            // ETAPA 16: Lógica especial
+            if (numeroObservaciones === 0) {
+                // No hay observaciones del coordinador todavía
+                if (numeroCorrecciones === 0) {
+                    // Primera subida: debe subir archivos obligatorios
+                    tieneCorrecciones = false // No hay observaciones que corregir
+                    yaEnvioCorrección = false // No ha enviado su primera subida
+                } else {
+                    // Ya envió al menos una vez, esperando observaciones del coordinador
+                    tieneCorrecciones = false // No hay observaciones pendientes
+                    yaEnvioCorrección = true // Ya envió su primera subida
+                }
+            } else {
+                // Hay observaciones del coordinador
+                tieneCorrecciones = true
+                yaEnvioCorrección = numeroCorrecciones >= numeroObservaciones
+            }
+        } else {
+            // OTRAS ETAPAS: Lógica original
+            tieneCorrecciones = numeroObservaciones > 0
+            yaEnvioCorrección = numeroCorrecciones >= numeroObservaciones
+        }
+
+        console.log(`✅ Lógica de estados (Etapa ${etapa}):`)
+        console.log(`   - Observaciones pendientes: ${numeroObservaciones}`)
+        console.log(`   - Correcciones enviadas: ${numeroCorrecciones}`)
+        console.log(`   - Tiene correcciones: ${tieneCorrecciones}`)
+        console.log(`   - Ya envió corrección: ${yaEnvioCorrección}`)
+
+        const estado: EstadoObservaciones = {
+            tieneCorrecciones,
+            numeroCorrecciones: numeroObservaciones, // El número que importa para la UI
+            yaEnvioCorrección,
+            observaciones: observaciones || []
+        }
+
+        return estado
+    } catch (error) {
+        console.error('❌ Error en getEstadoObservaciones:', error)
+        throw error
+    }
+}
+
+/**
+ * Obtiene TODAS las observaciones del trámite, agrupadas por etapas (2-4, 11, 16)
+ */
+export async function getAllObservacionesByTramite(tramiteId: number, etapaActual: number): Promise<{
+    observacionesPorEtapa: Record<number, any[]>;
+    totalObservaciones: number;
+    etapasConObservaciones: number[];
+}> {
+    try {
+        console.log(`🔍 Obteniendo todas las observaciones para trámite ${tramiteId} hasta etapa ${etapaActual}`)
+
+        // Obtener todas las observaciones del trámite hasta la etapa actual (solo 2-4, 11, 16)
+        const etapasPermitidas = [2, 3, 4, 11, 16].filter(etapa => etapa <= etapaActual)
+        
+        const { data: observaciones, error } = await supabase
+            .from('tbl_observaciones')
+            .select(`
+                id,
+                id_tramite,
+                id_etapa,
+                id_usuario,
+                id_rol,
+                visto_bueno,
+                observacion,
+                fecha,
+                usuario:id_usuario(
+                    id,
+                    nombres,
+                    apellidos
+                ),
+                rol_servicio:id_rol(
+                    id,
+                    servicio:id_servicio(
+                        id,
+                        nombre,
+                        descripcion
+                    )
+                ),
+                etapa:id_etapa(
+                    id,
+                    nombre,
+                    descripcion
+                )
+            `)
+            .eq('id_tramite', tramiteId)
+            .in('id_etapa', etapasPermitidas) // Solo etapas 2-4, 11, 16
+            .order('fecha', { ascending: false })
+
+        if (error) {
+            console.error('Error obteniendo todas las observaciones:', error)
+            throw new Error('Error al obtener las observaciones del trámite')
+        }
+
+        // Agrupar observaciones por etapa
+        const observacionesPorEtapa: Record<number, any[]> = {}
+        const etapasConObservaciones: number[] = []
+
+        if (observaciones && observaciones.length > 0) {
+            observaciones.forEach(obs => {
+                const etapa = obs.id_etapa
+                
+                if (!observacionesPorEtapa[etapa]) {
+                    observacionesPorEtapa[etapa] = []
+                    if (!etapasConObservaciones.includes(etapa)) {
+                        etapasConObservaciones.push(etapa)
+                    }
+                }
+                
+                observacionesPorEtapa[etapa].push(obs)
+            })
+        }
+
+        // Ordenar etapas
+        etapasConObservaciones.sort((a, b) => a - b)
+
+        const totalObservaciones = observaciones?.length || 0
+
+        console.log(`✅ Observaciones obtenidas:`)
+        console.log(`   - Total observaciones: ${totalObservaciones}`)
+        console.log(`   - Etapas con observaciones: ${etapasConObservaciones.join(', ')}`)
+        console.log(`   - Observaciones por etapa:`, Object.entries(observacionesPorEtapa).map(([etapa, obs]) => `Etapa ${etapa}: ${obs.length}`).join(', '))
+
+        return {
+            observacionesPorEtapa,
+            totalObservaciones,
+            etapasConObservaciones
+        }
+    } catch (error) {
+        console.error('❌ Error en getAllObservacionesByTramite:', error)
+        throw error
+    }
+}
+
+/**
+ * Obtiene los tipos de archivos requeridos para etapas 2, 3, 4, 11, 16
+ */
+export async function getTiposArchivosByEtapa(etapa: number, yaEnvioCorreccion = false): Promise<TipoArchivo[]> {
+    // Validar que sea etapa 2, 3, 4, 11, o 16
+    if (![2, 3, 4, 11, 16].includes(etapa)) {
+        throw new Error(`Etapa ${etapa} no soportada en ServiceObservaciones`)
+    }
+
+    try {
+        // Para etapas 2, 3, 4 usamos los mismos tipos que etapa 1
+        // Para etapa 11 usamos los tipos de borrador + constancias de bachiller
+        // Para etapa 16 usamos los tipos de tesis final post-sustentación
+        const tiposIds = etapa === 16
+            ? [20, 21] // Tesis final + observaciones sustentación
+            : etapa === 11
+                ? [7, 8, 10, 11, 12, 13] // Constancias + borrador de tesis (sin ID 9)
+                : [1, 2, 3, 4, 5] // Proyecto original
+
+        const { data, error } = await supabase
+            .from('dic_tipo_archivo')
+            .select('*')
+            .in('id', tiposIds)
+            .order('id')
+
+        if (error) {
+            console.error('Error obteniendo tipos de archivo:', error)
+            throw new Error('Error al obtener los tipos de archivo')
+        }
+
+        const tiposArchivo: TipoArchivo[] = data.map(tipo => ({
+            id: tipo.id,
+            nombre: tipo.nombre,
+            descripcion: tipo.descripcion,
+            // Configurar obligatorios según la etapa
+            obligatorio: etapa === 16
+                ? (yaEnvioCorreccion ? false : true) // En E16: obligatorio en primera subida, opcional después
+                : etapa === 11
+                    ? tipo.id === 10 // Solo Turnitin borrador es obligatorio en E11 (ID 11 ahora opcional)
+                    : [1, 2, 3].includes(tipo.id), // Proyecto, Turnitin, IA son obligatorios en E2-E4
+            max_size: 4, // Default 4MB
+        }))
+
+        console.log(`📁 Tipos de archivo para etapa ${etapa}:`, tiposArchivo.length)
+        return tiposArchivo
+    } catch (error) {
+        console.error('❌ Error en getTiposArchivosByEtapa:', error)
+        throw error
+    }
+}
+
+/**
+ * Envía correcciones para etapas 2, 3, 4, 11, 16
+ */
+export async function enviarCorreccion(
+    tramiteId: number,
+    etapa: number,
+    codigoProyecto: string,
+    correccionData: CorreccionFormData
+): Promise<void> {
+    // Validar que sea etapa 2, 3, 4, 11, o 16
+    if (![2, 3, 4, 11, 16].includes(etapa)) {
+        throw new Error(`Etapa ${etapa} no soportada en ServiceObservaciones`)
+    }
+
+    try {
+        console.log(`🚀 Enviando corrección para trámite ${tramiteId} en etapa ${etapa}`)
+
+        // 1. Obtener usuario actual
+        const { data: userData, error: userError } = await supabase.auth.getUser()
+        if (userError || !userData.user) {
+            throw new Error('No se pudo obtener la información del usuario')
+        }
+
+        const { data: userDbData, error: userDbError } = await supabase
+            .from('tbl_usuarios')
+            .select('id')
+            .eq('uuid', userData.user.id)
+            .single()
+
+        if (userDbError || !userDbData) {
+            throw new Error('No se pudo obtener la información del usuario desde la BD')
+        }
+
+        const numericUserId = userDbData.id
+
+        // 2. Desactivar metadatos anteriores
+        const { error: updateMetadatosError } = await supabase
+            .from('tbl_tramites_metadatos')
+            .update({ estado_tm: 0 })
+            .eq('id_tramite', tramiteId)
+            .eq('estado_tm', 1)
+
+        if (updateMetadatosError) {
+            console.error('Error desactivando metadatos anteriores:', updateMetadatosError)
+            throw new Error('Error al actualizar metadatos anteriores')
+        }
+
+        // 3. Insertar nuevos metadatos
+        const metadatosInsert = {
+            id_tramite: tramiteId,
+            id_etapa: etapa,
+            titulo: correccionData.metadatos.titulo,
+            abstract: correccionData.metadatos.abstract,
+            keywords: correccionData.metadatos.keywords,
+            presupuesto: correccionData.metadatos.presupuesto,
+            estado_tm: 1,
+            // Solo incluir conclusiones para etapas 11 y 16
+            ...((etapa === 11 || etapa === 16) && correccionData.metadatos.conclusiones && {
+                conclusiones: correccionData.metadatos.conclusiones
+            }),
+            // Para etapas 2-4, conclusiones es null
+            ...([2, 3, 4].includes(etapa) && { conclusiones: null })
+        }
+
+        const { data: nuevosMetadatos, error: metadatosError } = await supabase
+            .from('tbl_tramites_metadatos')
+            .insert([metadatosInsert])
+            .select('id')
+            .single()
+
+        if (metadatosError || !nuevosMetadatos) {
+            console.error('Error creando nuevos metadatos:', metadatosError)
+            throw new Error('Error al guardar los metadatos corregidos')
+        }
+
+        console.log(`✅ Nuevos metadatos creados con ID: ${nuevosMetadatos.id}`)
+
+        // 4. Procesar archivos (solo los enviados)
+        for (const archivo of correccionData.archivos) {
+            // Obtener archivos existentes del mismo tipo para calcular la siguiente letra
+            const { data: archivosExistentes } = await supabase
+                .from('tbl_archivos_tramites')
+                .select('nombre_archivo')
+                .eq('id_tramite', tramiteId)
+                .eq('id_tipo_archivo', archivo.tipoId)
+
+            // Calcular siguiente letra (A, B, C, ...)
+            let letra = 'A'
+            if (archivosExistentes && archivosExistentes.length > 0) {
+                letra = String.fromCharCode(65 + archivosExistentes.length) // A=65, B=66, etc.
+            }
+
+            // Desactivar archivos anteriores del mismo tipo
+            await supabase
+                .from('tbl_archivos_tramites')
+                .update({ estado_archivo: 0 })
+                .eq('id_tramite', tramiteId)
+                .eq('id_tipo_archivo', archivo.tipoId)
+                .eq('estado_archivo', 1)
+
+            // Determinar extensión
+            const extension = archivo.file.name.split('.').pop()?.toLowerCase()
+            if (!extension) {
+                throw new Error('No se pudo determinar la extensión del archivo')
+            }
+
+            // Generar nombre del archivo según la etapa
+            // Etapas 2-4: "B4-P25-200024A.pdf"
+            // Etapa 11: "B9-P25-200024A.pdf" (para borrador), etc.
+            const nombreArchivo = `${letra}${archivo.tipoId}-${codigoProyecto}.${extension}`
+            const storagePath = `tramite-${tramiteId}/${nombreArchivo}`
+
+            console.log(`📁 Subiendo archivo: ${storagePath}`)
+
+            // Subir archivo a storage
+            const { error: uploadError } = await supabase.storage
+                .from('tramites-documentos')
+                .upload(storagePath, archivo.file, {
+                    cacheControl: '3600',
+                    upsert: true,
+                })
+
+            if (uploadError) {
+                console.error('Error subiendo archivo:', uploadError)
+                throw new Error(`Error al subir el archivo: ${uploadError.message}`)
+            }
+
+            // Registrar en base de datos
+            const { error: dbError } = await supabase.from('tbl_archivos_tramites').insert([
+                {
+                    id_tramite: tramiteId,
+                    id_tipo_archivo: archivo.tipoId,
+                    nombre_archivo: nombreArchivo,
+                    storage: 'supabase',
+                    bucket: 'tramites-documentos',
+                    id_etapa: etapa,
+                    id_tramites_metadatos: nuevosMetadatos.id,
+                    estado_archivo: 1,
+                    max_size: 4,
+                },
+            ])
+
+            if (dbError) {
+                console.error('Error registrando archivo en BD:', dbError)
+                // Intentar limpiar archivo subido
+                await supabase.storage.from('tramites-documentos').remove([storagePath])
+                throw new Error('Error al registrar el archivo en la base de datos')
+            }
+
+            console.log(`✅ Archivo registrado: ${nombreArchivo}`)
+        }
+
+        // 5. Actualizar id_tramites_metadatos de archivos que no fueron modificados
+        // Obtener todos los tipos de archivo que fueron reemplazados en esta corrección
+        const tiposReemplazados = correccionData.archivos.map(a => a.tipoId)
+        
+        if (tiposReemplazados.length > 0) {
+            // Actualizar archivos activos que NO fueron reemplazados
+            const { error: updateOtherFilesError } = await supabase
+                .from('tbl_archivos_tramites')
+                .update({ id_tramites_metadatos: nuevosMetadatos.id })
+                .eq('id_tramite', tramiteId)
+                .eq('estado_archivo', 1)
+                .not('id_tipo_archivo', 'in', `(${tiposReemplazados.join(',')})`)
+
+            if (updateOtherFilesError) {
+                console.error('Error actualizando metadatos de archivos no modificados:', updateOtherFilesError)
+                // No lanzar error, pero registrar para debugging
+            } else {
+                console.log(`✅ Archivos no modificados actualizados con nuevo id_tramites_metadatos: ${nuevosMetadatos.id}`)
+            }
+        } else {
+            // Si no se reemplazó ningún archivo, actualizar todos los archivos activos
+            const { error: updateAllFilesError } = await supabase
+                .from('tbl_archivos_tramites')
+                .update({ id_tramites_metadatos: nuevosMetadatos.id })
+                .eq('id_tramite', tramiteId)
+                .eq('estado_archivo', 1)
+
+            if (updateAllFilesError) {
+                console.error('Error actualizando metadatos de todos los archivos:', updateAllFilesError)
+                // No lanzar error, pero registrar para debugging
+            } else {
+                console.log(`✅ Todos los archivos activos actualizados con nuevo id_tramites_metadatos: ${nuevosMetadatos.id}`)
+            }
+        }
+
+        // 6. Registrar en log de acciones
+        const numeroCorreccion = await getNumeroCorreccion(tramiteId, etapa)
+        const idAccion = getIdAccionCorrecion(etapa)
+        
+        const { error: logError } = await supabase.from('log_acciones').insert([
+            {
+                id_tramite: tramiteId,
+                id_accion: idAccion, // Dinámico según etapa
+                id_etapa: etapa,
+                id_usuario: numericUserId,
+                mensaje: `Corrección ${numeroCorreccion} enviada`,
+            },
+        ])
+
+        if (logError) {
+            console.error('Error registrando log de acción:', logError)
+            // No lanzar error, es información de auditoría
+        }
+
+        console.log(`🎉 Corrección enviada exitosamente para trámite ${tramiteId} en etapa ${etapa}`)
+    } catch (error) {
+        console.error('❌ Error en enviarCorreccion:', error)
+        throw error
+    }
+}
+
+// ================================
+// FUNCIONES AUXILIARES INTERNAS
+// ================================
+
+/**
+ * Obtiene el id_accion correcto para envío de correcciones según la etapa (solo 2, 3, 4, 11, 16)
+ */
+function getIdAccionCorrecion(etapa: number): number {
+    const etapaToIdAccion: Record<number, number> = {
+        2: 7,   // Etapa 2: "envio de correcciones etapa 2"
+        3: 12,  // Etapa 3: "envio de correcciones etapa 3"
+        4: 16,  // Etapa 4: "envio de correcciones etapa 4"
+        11: 40, // Etapa 11: "envio de correcciones etapa 11"
+        16: 63, // Etapa 16: "envio de correcciones etapa 16"
+    }
+    
+    const idAccion = etapaToIdAccion[etapa]
+    if (!idAccion) {
+        throw new Error(`No se encontró id_accion para la etapa ${etapa} en ServiceObservaciones`)
+    }
+    
+    return idAccion
+}
+
+/**
+ * Calcula el número de corrección basado en los logs de acciones (etapas 2, 3, 4, 11, 16)
+ */
+async function getNumeroCorreccion(tramiteId: number, etapa: number): Promise<number> {
+    try {
+        const idAccion = getIdAccionCorrecion(etapa)
+        
+        const { data, error } = await supabase
+            .from('log_acciones')
+            .select('id')
+            .eq('id_tramite', tramiteId)
+            .eq('id_etapa', etapa)
+            .eq('id_accion', idAccion)
+
+        if (error) {
+            console.error('Error contando correcciones:', error)
+            return 1
+        }
+
+        return (data?.length || 0) + 1
+    } catch (error) {
+        console.error('Error en getNumeroCorreccion:', error)
+        return 1
+    }
+}

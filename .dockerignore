@@ -73,10 +73,5 @@ Thumbs.db
 README.md
 docs/
 
-# Development files
-src/
-tsconfig.json
-*.md
-
 # Build artifacts that don't need to be in image
 dist/

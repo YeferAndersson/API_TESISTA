@@ -1,5 +1,4 @@
 import { Request, Response, NextFunction } from 'express'
-import jwt from 'jsonwebtoken'
 import { supabase } from '@/config/supabase'
 
 export interface AuthenticatedRequest extends Request {

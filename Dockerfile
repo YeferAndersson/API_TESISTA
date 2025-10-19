@@ -11,8 +11,8 @@ WORKDIR /app
 COPY package*.json ./
 COPY tsconfig.json ./
 
-# Instalar dependencias
-RUN npm ci --only=production
+# ✅ CAMBIO: Instalar TODAS las dependencias (incluyendo devDependencies para compilar)
+RUN npm ci
 
 # Copiar código fuente
 COPY src ./src
@@ -30,10 +30,14 @@ RUN adduser -S api -u 1001
 # Crear directorio de trabajo
 WORKDIR /app
 
-# Copiar dependencias de producción desde builder
-COPY --from=builder /app/node_modules ./node_modules
+# Copiar package files
+COPY package*.json ./
+
+# ✅ Instalar solo dependencias de producción en la imagen final
+RUN npm ci --only=production
+
+# Copiar solo el código compilado desde builder
 COPY --from=builder /app/dist ./dist
-COPY --from=builder /app/package*.json ./
 
 # Cambiar ownership al usuario no-root
 RUN chown -R api:nodejs /app

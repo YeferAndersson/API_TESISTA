@@ -7,7 +7,7 @@ const router = Router()
 router.get('/health', (req, res) => {
   res.json({
     status: 'OK',
-    message: 'API VRI Backend funcionando correctamente',
+    message: 'Theme Management API is healthy and operational',
     timestamp: new Date().toISOString(),
     version: '1.0.0'
   })

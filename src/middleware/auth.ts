@@ -24,18 +24,24 @@ export const authenticateToken = async (req: AuthenticatedRequest, res: Response
   }
 
   try {
+    console.log('🔐 Iniciando autenticación con token:', token.substring(0, 20) + '...')
+
     // Validar token con Supabase
     const { data: { user }, error } = await supabase.auth.getUser(token)
 
     if (error || !user) {
+      console.log('❌ Error validando token JWT:', error)
       return res.status(403).json({
         error: 'Token no válido o expirado',
         code: 'AUTH_TOKEN_INVALID'
       })
     }
 
+    console.log('✅ Token JWT válido para usuario UUID:', user.id)
+
     // Obtener datos del usuario desde la tabla personalizada
     // Usar supabaseAdmin para bypass RLS en autenticación
+    console.log('📋 Consultando tbl_usuarios con supabaseAdmin...')
     const { data: userData, error: userError } = await supabaseAdmin
       .from('tbl_usuarios')
       .select('id, nombres, apellidos, correo')
@@ -44,11 +50,15 @@ export const authenticateToken = async (req: AuthenticatedRequest, res: Response
       .single()
 
     if (userError || !userData) {
+      console.log('❌ Error consultando tbl_usuarios:', userError)
+      console.log('❌ Datos usuario obtenidos:', userData)
       return res.status(403).json({
         error: 'Usuario no encontrado en el sistema',
         code: 'USER_NOT_FOUND'
       })
     }
+
+    console.log('✅ Usuario encontrado en tbl_usuarios:', userData.id, userData.correo)
 
     // Agregar información del usuario al request
     req.user = {

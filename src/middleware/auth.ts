@@ -1,5 +1,5 @@
 import { Request, Response, NextFunction } from 'express'
-import { supabase } from '@/config/supabase'
+import { supabase, supabaseAdmin } from '@/config/supabase'
 
 export interface AuthenticatedRequest extends Request {
   user?: {
@@ -35,7 +35,8 @@ export const authenticateToken = async (req: AuthenticatedRequest, res: Response
     }
 
     // Obtener datos del usuario desde la tabla personalizada
-    const { data: userData, error: userError } = await supabase
+    // Usar supabaseAdmin para bypass RLS en autenticación
+    const { data: userData, error: userError } = await supabaseAdmin
       .from('tbl_usuarios')
       .select('id, nombres, apellidos, correo')
       .eq('uuid', user.id)

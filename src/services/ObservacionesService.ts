@@ -1,5 +1,5 @@
 // Servicio migrado desde ServiceObservaciones.ts
-import { supabase } from '@/config/supabase'
+import { supabase, supabaseAdmin } from '@/config/supabase'
 import type {
     ObservacionData,
     EstadoObservaciones,
@@ -20,7 +20,7 @@ export async function getEstadoObservaciones(tramiteId: number, etapa: number): 
         console.log(`🔍 Verificando observaciones para trámite ${tramiteId} en etapa ${etapa}`)
 
         // 1. Obtener todas las observaciones de la etapa
-        const { data: observaciones, error } = await supabase
+        const { data: observaciones, error } = await supabaseAdmin
             .from('tbl_observaciones')
             .select(`
                 id,
@@ -62,7 +62,7 @@ export async function getEstadoObservaciones(tramiteId: number, etapa: number): 
 
         // 3. Contar correcciones enviadas (logs con id_accion dinámico según etapa)
         const idAccion = getIdAccionCorrecion(etapa)
-        const { data: logCorrecciones, error: logError } = await supabase
+        const { data: logCorrecciones, error: logError } = await supabaseAdmin
             .from('log_acciones')
             .select('id, fecha, mensaje')
             .eq('id_tramite', tramiteId)
